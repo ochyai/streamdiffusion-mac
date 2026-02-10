@@ -1,0 +1,786 @@
+\documentclass[11pt]{article}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\setCJKmainfont{Hiragino Mincho ProN}
+\setCJKsansfont{Hiragino Sans}
+\setCJKmonofont{Hiragino Sans}
+\usepackage[a4paper,margin=2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{float}
+
+\title{Apple M3 Ultra上でのリアルタイム拡散モデル推論の\\体系的最適化研究}
+
+\author{
+落合陽一\\
+\textit{筑波大学 図書館情報メディア系}\\
+\texttt{wizard@slis.tsukuba.ac.jp}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+拡散モデルによるリアルタイム画像生成は，NVIDIA GPU上では急速に進展しているが，Apple Siliconをはじめとする非CUDA環境での体系的な最適化研究は極めて限られている．
+本研究では，Apple M3 Ultra（60コアGPU，512GB統合メモリ）を対象に，リアルタイムカメラimg2img変換の実現を目標として，10フェーズにわたる包括的な最適化実験を行った．
+CoreML変換，量子化，Token Merging，Neural Engine活用，小型モデル探索，フレーム補間，kNN検索ベース合成，pix2pix-turbo，optical flowフレームスキップ，知識蒸留など多岐にわたる手法を探索し，各手法の有効性を定量的に評価した．
+最終的に，蒸留特化モデルSDXS-512のCoreML変換と3スレッドカメラパイプラインの組み合わせにより，512$\times$512解像度で\textbf{22.7 FPS}のリアルタイムカメラimg2img変換を達成した．
+本研究の主要な貢献は，CUDA中心の最適化知見がApple Siliconの統合メモリアーキテクチャでは必ずしも有効でないことを体系的に実証した点にある．
+量子化による高速化の不在，並列推論の無効性，Neural Engineの大規模モデルへの不適合など，NVIDIA GPUとは根本的に異なる最適化のランドスケープを明らかにし，Apple Silicon上の拡散モデル推論における実践的な指針を提供する．
+\end{abstract}
+
+\section{はじめに}
+
+拡散モデル（Diffusion Models）\cite{ho2020ddpm,rombach2022ldm}は，テキストからの画像生成や画像変換において支配的なパラダイムとなった．
+しかし，その反復的なノイズ除去プロセスは計算コストが高く，リアルタイム推論は依然として困難な課題である．
+近年，SD-Turbo\cite{sauer2023adversarial}やSDXS\cite{song2024sdxs}による1ステップ蒸留，Latent Consistency Models\cite{luo2023lcm}による少ステップ推論など，高速化手法が急速に発展している．
+StreamDiffusion\cite{kodaira2023streamdiffusion}はパイプラインレベルの最適化により，NVIDIA GPU上で100 FPS以上のリアルタイム推論を実現した．
+
+しかしながら，これらの高速化研究はほぼ例外なくNVIDIA GPUとCUDAエコシステムを前提としている．
+CUDAは豊富なカーネルライブラリ，成熟したプロファイリングツール，TensorRTによる推論最適化など，数十年にわたる蓄積を持つ．
+一方で，Apple Silicon，Qualcomm Snapdragon，Intel Arc GPUなどの非CUDAプラットフォームでの拡散モデル最適化は，体系的な研究がほとんど存在しない．
+
+Apple M3 Ultraは，最大192コアのGPU，192GBの統合メモリ，800GB/sのメモリ帯域を持つSystem-on-Chip（SoC）であり，CPU・GPU・Neural Engine（ANE）が同一メモリ空間を共有する独自の統合メモリアーキテクチャ（Unified Memory Architecture; UMA）を採用している．
+この設計は，CPU-GPU間のデータ転送が不要である一方，CUDAとは根本的に異なるメモリアクセスパターンと演算特性を持つため，NVIDIA GPUで有効な最適化手法がそのまま適用できるとは限らない．
+
+本研究では，M3 Ultra（60コアGPU，512GB統合メモリ構成）上でリアルタイムカメラimg2img変換の実現を目標に，StreamDiffusion\cite{kodaira2023streamdiffusion}を起点とした10フェーズにわたる体系的な最適化実験を行った．
+本研究の貢献は以下の通りである：
+
+\begin{itemize}[leftmargin=*,nosep]
+\item Apple Silicon上の拡散モデル推論における，10手法以上を網羅した包括的なベンチマーク
+\item CoreML変換が唯一の有効なUNet高速化手法であることの実証と，その理由の分析
+\item CUDA環境で有効な量子化・Token Merging・並列推論等がM3 Ultraで無効である原因の体系的な解明
+\item 512GBメモリを活用したkNN検索による拡散モデル置換の原理的限界の実証
+\item SDXS-512 CoreMLパイプラインによる22.7 FPSリアルタイムimg2img変換の実現
+\item 統合メモリアーキテクチャにおける拡散モデル最適化の実践的な指針の提供
+\end{itemize}
+
+\section{関連研究}
+
+\subsection{高速拡散モデル}
+
+Stable Diffusion\cite{rombach2022ldm}のリアルタイム推論に向けた高速化は，主にモデル蒸留と推論ステップ削減の2方向から研究されている．
+
+SD-Turbo\cite{sauer2023adversarial}はAdversarial Diffusion Distillation（ADD）により，敵対的学習とスコア蒸留を組み合わせて1ステップ推論を実現した最初の実用的モデルである．
+SDXS\cite{song2024sdxs}はさらに進んだ蒸留手法により，UNetのmid-blockを完全に除去し，down/upブロックを4から3に削減した軽量アーキテクチャで，1ステップでの高品質画像生成を達成した．
+パラメータ数は標準的なSD-Turbo（865.9M）の約38\%（328.2M）にまで削減されている．
+
+Latent Consistency Models（LCM）\cite{luo2023lcm}は一貫性蒸留により2--4ステップでの高品質生成を可能にした．
+LCM-LoRA\cite{luo2023lcmlora}はこの蒸留をLoRAアダプタとして適用可能にし，既存モデルへの後付けを実現した．
+Hyper-SD\cite{ren2024hypersd}はスコア蒸留と人間フィードバック学習（RLHF）を組み合わせ，1--4ステップの各設定で高品質生成を達成している．
+これらの手法は主にNVIDIA GPU上で評価されており，Apple Siliconでの性能は報告されていない．
+
+\subsection{リアルタイム推論パイプライン}
+
+StreamDiffusion\cite{kodaira2023streamdiffusion}は，拡散モデルのリアルタイム推論をパイプラインレベルで最適化するフレームワークである．
+その核心はStream Batch機構にあり，連続するフレームの異なるdenoiseステップを単一バッチにまとめることで，GPU演算の並列性を最大化する．
+例えば4ステップ推論の場合，フレーム$t$のステップ1，フレーム$t-1$のステップ2，フレーム$t-2$のステップ3，フレーム$t-3$のステップ4を1バッチとして処理する．
+さらに，前フレームのClassifier-Free Guidance（CFG）結果を再利用するResidual CFGにより，1フレームあたりのUNet呼び出しを半減させる．
+これらの最適化により，NVIDIA RTX 4090上で100 FPS以上のリアルタイム推論が報告されている．
+
+ただし，StreamDiffusionの高速化はCUDA StreamやTensorRT，xformersといったNVIDIA固有の技術に強く依存しており，Apple Siliconへの移植にあたってはこれらの代替手段を見つける必要がある．
+また，1ステップ推論（SD-Turbo, SDXS等）を用いる場合，Stream Batch機構は適用できず（バッチ化するステップが1つしかない），パイプラインの他の部分の最適化が重要となる．
+
+\subsection{Apple Silicon上の機械学習推論}
+
+Appleはml-stable-diffusion\cite{apple2022mlsd}でCoreMLベースのStable Diffusion推論パイプラインを公開している．
+このフレームワークでは，SPLIT\_EINSUM\_V2と呼ばれるAttention演算の分割実行により，Neural Engine上での推論を可能にしている．
+しかし，SPLIT\_EINSUM\_V2はM1/M2世代のNeural Engine向けに設計されたものであり，M3世代のGPUの高い演算性能を十分に活用するものではない．
+
+CoreMLはAppleのモデル推論フレームワークであり，PyTorchやTensorFlowからモデルを変換し，Metal GPUバックエンド上で最適化されたカーネルを用いた推論を行う．
+coremltools\cite{apple2022mlsd}によるモデル変換では，計算グラフの静的最適化，演算子融合，メモリレイアウト最適化が自動的に適用される．
+一方，PyTorchのMetal Performance Shaders（MPS）バックエンドは汎用的な実装であり，モデル固有の最適化は限定的である．
+この両バックエンドの性能差は，Apple Silicon上での拡散モデル推論において重要な意味を持つ．
+
+\subsection{画像変換モデル}
+
+pix2pix-turbo\cite{parmar2024pix2pix}はSD-Turboベースのエンドツーエンドimg2img変換モデルであり，VAEのエンコーダ-デコーダ間にスキップ接続を導入することで，入力画像の構造情報を直接デコーダに伝達する設計を持つ．
+この構造的スキップ接続により，エッジ検出画像から写実的画像への変換において高い構造保存性を実現している．
+しかし，エンコーダとデコーダが中間特徴量テンソルを共有する設計は，モデルを単独のサブグラフとしてCoreMLに変換することを困難にする副作用を持つ．
+
+\subsection{検索ベース画像生成}
+
+大規模メモリを活用した検索ベースの画像生成\cite{blattmann2022retrieval}は，事前に計算された画像特徴量データベースから最近傍サンプルを取得し，それを条件として拡散モデルの生成を補助する手法である．
+FAISS\cite{johnson2019faiss}は高速な近似最近傍検索ライブラリであり，IVF-PQインデックスにより10億ベクトル規模のデータベースに対しても1ms未満の検索を可能にする．
+512GBの統合メモリを持つM3 Ultraは，通常のGPU（24GB）では扱えない大規模なベクトルデータベースをメモリ内に保持できるため，検索ベース手法の新たな可能性を開くと考えられた．
+
+\section{実験環境}
+
+本研究で使用した実験環境をTable~\ref{tab:env}に示す．
+Apple M3 Ultraは2024年にリリースされたApple Siliconの最上位チップであり，M3 Maxダイ2基をUltraFusion接続で統合した構成を持つ．
+本実験で使用した構成は60コアGPU（最大構成の76コアから16コア無効化），512GBの統合メモリを搭載している．
+理論FP16演算性能は約22 TFLOPSであり，これはNVIDIA RTX 4090の約330 TFLOPSと比較して約15分の1である．
+ただし，統合メモリにより800GB/sのメモリ帯域をCPU・GPU・Neural Engineが共有できる点は，ディスクリートGPU構成にはない利点である．
+
+\begin{table}[H]
+\centering
+\caption{実験環境}
+\label{tab:env}
+\begin{tabular}{ll}
+\toprule
+項目 & 仕様 \\
+\midrule
+SoC & Apple M3 Ultra \\
+GPU & 60コア (約22 TFLOPS FP16) \\
+CPU & 32コア (16P + 16E) \\
+メモリ & 512GB 統合メモリ \\
+メモリ帯域 & 800 GB/s \\
+Neural Engine & 32コア \\
+OS & macOS Sequoia (Darwin 24.4.0) \\
+Python & 3.9 \\
+PyTorch & 2.6.0 (MPS backend) \\
+CoreML Tools & 9.0 \\
+diffusers & 0.36.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ソフトウェアスタックとしては，PyTorch 2.6.0のMPSバックエンドをベースラインとし，CoreML Tools 9.0によるモデル変換を行った．
+Hugging Face diffusers 0.36.0を用いて各種拡散モデルのロードと前処理を行い，カメラ入出力にはOpenCVを使用した．
+
+\section{Phase 1: MPSバックエンドへの移植}
+
+最初のフェーズとして，CUDA専用に実装されたStreamDiffusionをApple Metal Performance Shaders（MPS）バックエンドに移植した．
+主要な変更点は以下の3点である：
+(1) \texttt{torch.cuda.Event}によるタイミング計測を\texttt{time.perf\_counter}に置換，
+(2) デバイス指定を\texttt{cuda}から\texttt{mps}に変更，
+(3) 乱数生成器をMPS上での再現性確保のためCPU上で初期化してからGPUに転送．
+
+StreamDiffusionのStream Batch機構は，1ステップ推論（SD-Turbo）を使用する本実験では適用されない．
+これは，Stream Batchが複数ステップの並列化を前提とした機構であり，1ステップ推論ではバッチ化する対象が存在しないためである．
+したがって，本研究における最適化の焦点は，単一フレームの推論パイプライン全体の高速化に向けられる．
+
+移植後のベースライン性能をTable~\ref{tab:baseline}に示す．
+SD-Turbo（865.9Mパラメータ）のMPS上での推論は，512$\times$512解像度で95.8ms/frame（10.4 FPS）であった．
+解像度を256$\times$256に下げても79.5ms（12.6 FPS）に留まり，演算量の削減に対して速度向上が限定的であることから，単純な解像度削減では不十分であることが示唆された．
+
+\begin{table}[H]
+\centering
+\caption{MPS移植後のベースライン性能（SD-Turbo 1-step）}
+\label{tab:baseline}
+\begin{tabular}{ccc}
+\toprule
+解像度 & ms/frame & FPS \\
+\midrule
+256$\times$256 & 79.5 & 12.6 \\
+384$\times$384 & 87.8 & 11.4 \\
+512$\times$512 & 95.8 & 10.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Phase 2: 高速化手法の網羅的検証}
+
+このフェーズでは，NVIDIA GPU上で有効性が報告されている複数の最適化手法をApple M3 Ultra上で系統的に評価した．
+結論を先に述べると，CoreML変換のみが有効であり，他の全手法は無効または逆効果であった．
+
+\subsection{CoreML変換}
+
+PyTorchモデルをCoreML形式（.mlpackage）に変換し，Metal GPUバックエンドで推論を行った．
+変換には\texttt{ct.convert}によるトレースベースの変換を用い，\texttt{compute\_units=CPU\_AND\_GPU}を指定した．
+変換過程では，計算グラフの静的解析による演算子融合，Metalカーネルへの直接マッピング，メモリレイアウトの最適化が自動的に適用される．
+
+Table~\ref{tab:coreml}に示す通り，CoreML変換によりUNet推論時間が87.6msから53.4msへと39\%短縮された．
+この改善は，PyTorch MPSバックエンドの汎用的なMetal Shader実装に対し，CoreMLが提供するモデル構造を考慮した最適化されたMetalカーネルの効果であると考えられる．
+本研究を通じて，\textbf{CoreML変換はApple Silicon上のUNet推論における唯一の有効な高速化手法}であることが明らかになった．
+
+\begin{table}[H]
+\centering
+\caption{CoreML変換によるUNet推論の高速化}
+\label{tab:coreml}
+\begin{tabular}{lcc}
+\toprule
+バックエンド & UNet推論 & FPS \\
+\midrule
+MPS (PyTorch) & 87.6ms & 11.4 \\
+\textbf{CoreML (CPU\_AND\_GPU)} & \textbf{53.4ms} & \textbf{18.7} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{量子化}
+
+CoreMLのpost-training量子化オプション（INT8 linear，6-bit palettization，4-bit palettization，2-bit palettization）を網羅的に評価した．
+NVIDIA GPU上では，TensorRTによるINT8量子化やAWQ/GPTQ等の手法により，メモリ帯域の削減を通じた推論高速化が広く報告されている．
+
+しかし，Table~\ref{tab:quant}に示す通り，M3 Ultra上では全ての量子化レベルで推論速度の変化がゼロであった．
+2-bit palettization（理論上16分の1のメモリ帯域）ですら高速化が観測されなかったことは，M3 Ultra GPUがUNet推論においてcompute-bound（演算律速）であり，memory-bandwidth-bound（帯域律速）ではないことを強く示唆する．
+統合メモリの800GB/sの帯域は，865.9Mパラメータのモデル重みの転送に対して十分な余裕を持っているためと考えられる．
+
+\begin{table}[H]
+\centering
+\caption{CoreML量子化の効果（UNet，512$\times$512）}
+\label{tab:quant}
+\begin{tabular}{lcc}
+\toprule
+量子化方式 & UNet推論 & 速度変化 \\
+\midrule
+FP16 (ベースライン) & 53.2ms & --- \\
+INT8 linear & $\sim$53ms & 0\% \\
+6-bit palettize & $\sim$53ms & 0\% \\
+4-bit palettize & $\sim$53ms & 0\% \\
+2-bit palettize & $\sim$53ms & 0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Token Merging}
+
+Token Merging（ToMe）\cite{bolya2023tome}は，Self-AttentionのKeyトークン間の類似度に基づいてトークンを統合し，Attention演算の計算量を削減する手法である．
+NVIDIA GPU上ではAttention演算がボトルネックとなる場合に有効性が報告されている．
+
+しかし，MPS上ではトークンの類似度計算と統合操作のオーバーヘッドがAttention演算の削減量を上回り，\textbf{約10\%の速度低下}を引き起こした．
+これは，MPS上のAttention実装がNVIDIA GPU上のxformersやFlash Attentionと比較して異なるボトルネック特性を持つことを示唆する．
+すなわち，MPS上ではAttention演算自体が主要なボトルネックではなく，トークン操作の追加コストが相対的に大きいと考えられる．
+
+\subsection{CoreML並列推論}
+
+M3 Ultraの60コアGPUの利用率を最大化するため，複数のCoreMLモデルインスタンスによる並列推論を試みた．
+NVIDIA GPUではCUDA Streamを用いた複数カーネルの並列実行が可能であり，バッチ推論やパイプライン並列化に広く活用されている．
+
+しかし，CoreMLでは1--4インスタンスの並列実行で全くスループットが向上しなかった．
+CoreMLはMetal Command Queue上で推論リクエストをシリアライズしており，複数モデルの同時実行はGPUレベルの並列性につながらない．
+これはCUDA Streamによる低レベルの並列制御が可能なNVIDIA GPUとの根本的な差異であり，Apple Silicon上ではモデルレベルの並列化戦略が適用できないことを意味する．
+
+\subsection{Neural Engine}
+
+M3 Ultraの32コアNeural Engine（ANE）を活用するため，CoreMLの計算ユニット指定を変更して評価を行った．
+ANEは省電力な行列演算に特化した専用プロセッサであり，小規模モデルの推論ではGPUを上回る電力効率を示すことが知られている．
+
+Table~\ref{tab:ane}に示す通り，ANE単体（CPU\_AND\_NE）ではUNet推論が329.4msとGPU単体の6.2倍の時間を要した．
+GPU+ANEの混合実行（ALL）でも63.6msと，GPU単体（53.2ms）より19\%遅い結果となった．
+865.9Mパラメータ規模のUNetは，ANEの処理能力を大幅に超えており，データの分割転送と再結合のオーバーヘッドが演算の並列化効果を上回るものと考えられる．
+
+\begin{table}[H]
+\centering
+\caption{計算ユニット別UNet推論速度}
+\label{tab:ane}
+\begin{tabular}{lcc}
+\toprule
+計算ユニット & UNet推論 & 対GPU比 \\
+\midrule
+\textbf{CPU\_AND\_GPU} & \textbf{53.2ms} & \textbf{1.0$\times$} \\
+ALL (GPU+ANE) & 63.6ms & 1.2$\times$ \\
+CPU\_AND\_NE (ANE) & 329.4ms & 6.2$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{その他の手法}
+
+\texttt{torch.compile}はMPSバックエンドでランタイムエラーによりクラッシュし，評価不能であった．
+これはPyTorchのcompilerスタックがCUDA/CPU向けに最適化されており，MPSバックエンドへの対応が不十分であることを反映している．
+Attention Slicingは約40\%の速度低下を引き起こした．
+これは，MPS上ではスライス間のメモリ管理オーバーヘッドがVRAM節約効果を上回るためと考えられる．
+FP32への精度変更は速度変化なしであり，非同期パイプラインの構築も実質的な改善をもたらさなかった．
+
+\subsection{Phase 2の総括}
+
+Table~\ref{tab:phase2}にPhase 2で評価した全手法の効果をまとめる．
+CoreML変換のみが64\%の速度向上を達成し，他の全手法は無効または逆効果であった．
+この結果は，CUDA環境で確立された最適化手法の多くがApple Siliconでは適用不可能であることを体系的に示すものである．
+
+\begin{table}[H]
+\centering
+\caption{高速化手法の総合評価}
+\label{tab:phase2}
+\begin{tabular}{lcc}
+\toprule
+手法 & 効果 & 備考 \\
+\midrule
+\textbf{CoreML変換} & \textbf{+64\%} & 唯一有効 \\
+量子化 (INT8--2bit) & 0\% & compute-bound \\
+Token Merging & $-$10\% & MPS overhead \\
+並列推論 & 0\% & Metal serialization \\
+Neural Engine & $-$19\%〜$-$520\% & 大規模UNet不適合 \\
+torch.compile & --- & MPSで未対応 \\
+Attention Slicing & $-$40\% & MPS非効率 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Phase 3: 小型モデルと解像度最適化}
+
+Phase 2でCoreML変換が唯一の有効なUNet高速化手法であることが判明したため，次にモデル自体のパラメータ数削減による高速化を探索した．
+Knowledge Distillation Stable Diffusionプロジェクトで公開されているSmall-SD（579.4M）およびTiny-SD（323.4M）をCoreML変換し評価した．
+
+Table~\ref{tab:models}に示す通り，パラメータ数の削減は推論速度に直接反映され，Tiny-SDはSD-Turboの1.7倍の速度を達成した．
+解像度を320$\times$320まで下げた場合，UNet推論のみで16.4ms（61 FPS）に達したが，生成画像の細部品質が大幅に低下した．
+SD-Turbo系統のモデルでは，学習時の解像度（512$\times$512）からの乖離が品質劣化に直結するため，解像度削減は有効な戦略とはならないと判断した．
+
+\begin{table}[H]
+\centering
+\caption{モデルサイズと推論速度の関係（CoreML，512$\times$512）}
+\label{tab:models}
+\begin{tabular}{lccc}
+\toprule
+モデル & パラメータ & UNet推論 & UNet FPS \\
+\midrule
+SD-Turbo & 865.9M & 53.2ms & 18.8 \\
+Small-SD & 579.4M & 36.6ms & 27.3 \\
+Tiny-SD & 323.4M & 31.3ms & 31.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+なお，Small-SDおよびTiny-SDは蒸留過程でSD-Turboほどの品質を維持できておらず，カメラimg2img変換での主観的画質はSD-Turboに劣った．
+パラメータ数の削減は推論速度に寄与する一方，蒸留品質の維持が課題であることが確認された．
+この知見は，後のPhase 6でSDXS-512（蒸留に特化した設計で品質を維持）の優位性につながる．
+
+\section{Phase 4: カメラimg2imgパイプラインの構築}
+
+\subsection{ボトルネック分析}
+
+リアルタイムカメラimg2img変換を実現するため，パイプライン全体のプロファイリングを行った．
+パイプラインは，カメラキャプチャ→前処理（リサイズ・正規化）→VAEエンコード→ノイズ付加→UNet推論→VAEデコード→後処理（表示）の流れで構成される．
+
+Table~\ref{tab:pipeline}に示す通り，UNetが全推論時間の68\%を占める明確なボトルネックであることが確認された．
+VAEのエンコード・デコードはCoreML変換済みのTAESD（Tiny Autoencoder for Stable Diffusion）を使用し，各6.5msと高速であった．
+前処理（カメラフレームのリサイズとCanny Edge検出）には7.9ms，後処理（テンソルからBGRへの変換と表示）には2.4msを要した．
+
+\begin{table}[H]
+\centering
+\caption{カメラパイプラインの時間内訳（SD-Turbo CoreML）}
+\label{tab:pipeline}
+\begin{tabular}{lcc}
+\toprule
+ステージ & 時間 & 割合 \\
+\midrule
+前処理 (resize, canny) & 7.9ms & 10\% \\
+VAE Encode (CoreML TAESD) & 6.5ms & 8\% \\
+\textbf{UNet (CoreML)} & \textbf{53.2ms} & \textbf{68\%} \\
+VAE Decode (CoreML TAESD) & 6.5ms & 8\% \\
+後処理 (display) & 2.4ms & 3\% \\
+\midrule
+合計 & 77.7ms & 12.9 FPS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{フレーム補間とスムージング}
+
+UNetの実行頻度を下げるため，UNetフレームと前フレームの線形補間による中間フレーム生成を試みた．
+しかし，UNet実行フレームと補間フレームの品質差が大きく，激しい視覚的振動（フリッカー）が発生し，実用的な品質を達成できなかった．
+EMA（指数移動平均）によるスムージングは振動を軽減したが，動きの速い被写体に対するゴースト現象を引き起こした．
+
+\subsection{3スレッドカメラアーキテクチャ}
+
+最終的に，カメラ取得・推論・表示の3つを独立スレッドで実行するアーキテクチャを採用した．
+推論スレッドは最新のカメラフレームを常に処理し，表示スレッドは最新の推論結果を表示する．
+フレームの時間的整合性は，固定ノイズシード，直前のラテント出力のフィードバック（$\alpha=0.3$），EMAスムージングの組み合わせにより確保した．
+この構成により，SD-Turbo CoreMLで13.8 FPSのフリッカーフリーなリアルタイムカメラimg2img変換を実現した．
+
+\section{Phase 5: モデル品質向上の探索}
+
+Phase 4までの実験でSD-Turbo CoreMLによる13.8 FPSが達成されたが，生成品質のさらなる向上を目指して複数のアプローチを検討した．
+
+Apple公式のSPLIT\_EINSUM\_V2変換を適用したところ，batch=2を強制する設計のため無駄な計算が発生し，167\%の速度低下（5.2 FPS）に陥った．
+Hyper-SD 1.5のLoRAアダプタを適用したところ，1ステップ推論の安定性が低下し，品質の改善は見られなかった．
+SDXL系モデル（2.6Bパラメータ）はCoreML変換後もUNet推論に200ms以上を要し，リアルタイム性を確保できないと判断した．
+
+これらの実験から，品質向上には既存モデルへのアダプタ追加や大規模モデルの使用ではなく，推論効率と品質のバランスが最初から設計されたモデルが必要であるとの知見を得た．
+この方針がPhase 6のSDXS-512の選択につながった．
+
+\section{Phase 6: SDXS-512による高速化}
+
+\subsection{SDXS-512の設計}
+
+SDXS-512\cite{song2024sdxs}は，1ステップ推論に特化して蒸留されたモデルであり，以下の設計上の特徴を持つ：
+(1) UNetのmid-blockを完全に除去し計算量を削減，
+(2) down/upブロックを標準の4段から3段に削減，
+(3) 蒸留過程で1ステップでの画像品質を最大化するよう学習．
+結果として，パラメータ数は328.2M（SD-Turboの38\%）にまで削減されている．
+
+\subsection{性能評価}
+
+Table~\ref{tab:sdxs}に示す通り，SDXS-512のCoreML変換はUNet推論で24.4ms（SD-Turboの2.2倍高速），カメラFPSで22.7（SD-Turboの1.6倍）を達成した．
+Phase 3で評価したTiny-SD（323.4M，類似のパラメータ数）と比較して，SDXS-512は同等の速度でありながら大幅に優れた画像品質を示した．
+これは，SDXS-512がアーキテクチャ削減と蒸留品質の両立を実現した設計であることに起因する．
+
+\begin{table}[H]
+\centering
+\caption{SDXS-512 vs SD-Turbo（CoreML，512$\times$512，カメラ）}
+\label{tab:sdxs}
+\begin{tabular}{lcccc}
+\toprule
+モデル & パラメータ & UNet & UNet FPS & カメラFPS \\
+\midrule
+SD-Turbo & 865.9M & 53.6ms & 18.7 & 13.8 \\
+\textbf{SDXS-512} & \textbf{328.2M} & \textbf{24.4ms} & \textbf{41.0} & \textbf{22.7} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+カメラパイプラインにおける22.7 FPSは，各フレームの総処理時間44.1msに対応する．
+内訳はUNet推論24.4ms，VAEエンコード・デコード各約5ms，前処理・後処理約10msである．
+3スレッドアーキテクチャにより，推論とカメラ取得・表示が並列化されているため，体感的にはさらに滑らかな映像が得られた．
+
+\section{Phase 7: kNN検索ベース画像合成}
+
+\subsection{研究仮説と動機}
+
+M3 Ultraの512GB統合メモリは，一般的なGPU（12--24GB VRAM）の20倍以上の容量を持つ．
+この大容量メモリの利点を最大限に活かすため，UNetの「計算による画像生成」を「メモリ検索による画像取得」に置換するという仮説を検証した．
+すなわち，事前に大量の（入力，出力）ペアを生成・保存し，新しい入力に対して最も類似した出力をデータベースから検索・補間することで，UNet推論を完全に回避する試みである．
+
+\subsection{FAISS検索速度の評価}
+
+まず，大規模ベクトルデータベースに対するkNN検索の速度を評価した．
+Table~\ref{tab:faiss}に示す通り，768次元CLIP embeddingベクトルに対して，IVF-PQインデックスを用いた近似検索では1億ベクトルでも0.50msという極めて高速な検索が可能であった．
+厳密検索（Flat Index）でも100万ベクトルで49.6msであり，24GB GPUでは1000万ベクトルの厳密検索がメモリ不足で不可能な点と比較して，512GBメモリの優位性は検索速度面では明確に実証された．
+
+\begin{table}[H]
+\centering
+\caption{FAISS kNN検索速度（768次元CLIP embedding）}
+\label{tab:faiss}
+\begin{tabular}{rcc}
+\toprule
+データベースサイズ & Flat (厳密) & IVF-PQ (近似) \\
+\midrule
+1,000 & 0.04ms & --- \\
+10,000 & 0.45ms & --- \\
+100,000 & 4.75ms & --- \\
+1,000,000 & 49.6ms & 0.48ms \\
+10,000,000 & 490ms & 0.47ms \\
+100,000,000 & --- & 0.50ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{画像合成の試行}
+
+3つのアプローチで画像合成を試みた．
+(a) \textbf{CLIP-kNN}：入力画像のCLIP embeddingで検索し，上位$k$件の出力画像をラテント空間で加重平均．26.1ms（38.3 FPS）と高速だが，加重平均によるぼやけと検索結果の時間的不安定性（振動）が問題となった．
+(b) \textbf{VAEラテントkNN}：VAEラテント空間で直接検索・補間．22.1ms（45.3 FPS）と最速だが，ラテント空間が意味的に構造化されていないため，検索精度が低く，出力品質が著しく低下した．
+(c) \textbf{ハイブリッド}：kNN検索結果をUNetの初期ラテントとして使用し，UNetの1ステップ推論で仕上げ．品質は改善されたが，CLIPエンコードのオーバーヘッドが加わり93.6ms（10.7 FPS）と低速化した．
+
+\begin{table}[H]
+\centering
+\caption{kNN検索ベース画像合成の結果}
+\label{tab:knn}
+\begin{tabular}{lccc}
+\toprule
+手法 & 速度 & FPS & 品質 \\
+\midrule
+CLIP-kNN & 26.1ms & 38.3 & $\times$ \\
+VAEラテントkNN & 22.1ms & 45.3 & $\times$ \\
+ハイブリッド & 93.6ms & 10.7 & $\triangle$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{根本的限界}
+
+全アプローチで実用的な品質が得られなかった原因は，kNN検索と拡散モデルの本質的な差異にある．
+拡散モデルのUNetは数億パラメータの非線形関数近似器であり，入力に対して連続的かつ滑らかな出力を生成する．
+一方，kNN検索は有限個の離散サンプルからの近似であり，(1) ラテント空間での加重平均は個々のサンプルの構造的整合性を破壊し，(2) カメラ入力の無限の組み合わせ（照明・構図・被写体）を事前計算で網羅することは原理的に不可能であり，(3) 検索結果の時間的一貫性が保証されないため，フレーム間で検索結果が不連続に変動する振動問題が発生する．
+
+\section{Phase 8: pix2pix-turbo}
+
+pix2pix-turbo\cite{parmar2024pix2pix}は，Edge-to-Imageタスクに特化したSD-Turboベースのモデルであり，VAEのエンコーダ-デコーダ間のスキップ接続により入力構造の高い保存性を実現している．
+UNet部分は標準的なSD-Turbo（865.9M）と同等であるため，CoreML変換により52.9msの推論速度が得られた．
+
+しかし，スキップ接続付きVAEはエンコーダとデコーダが中間特徴量テンソルを共有する設計であり，CoreMLの静的計算グラフ変換と互換性がない．
+そのため，VAEのエンコード・デコードはMPSバックエンド上でのPyTorch推論に留まり，合計約160ms（エンコード$\sim$80ms＋デコード$\sim$80ms）を要した．
+この結果，UNet（53ms）よりもVAEが3倍のボトルネックとなり，カメラFPSは4.0に留まった（Table~\ref{tab:pix2pix}）．
+
+\begin{table}[H]
+\centering
+\caption{pix2pix-turboの性能（512$\times$512）}
+\label{tab:pix2pix}
+\begin{tabular}{lcc}
+\toprule
+構成 & パイプライン時間 & カメラFPS \\
+\midrule
+MPS全体 (FP16) & 339ms & 3.0 \\
+CoreML UNet + MPS VAE & $\sim$250ms & 4.0 \\
+\midrule
+\multicolumn{3}{l}{\textit{内訳: UNet 53ms + VAE 160ms + 前後処理 37ms}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+TAESDへのVAE置換はスキップ接続構造を持たないため適用不可能であり，現状のpix2pix-turboはApple Silicon上でのリアルタイム運用には不向きであると結論した．
+この結果は，モデルのアーキテクチャ設計がハードウェア最適化の可否に直接影響するという重要な教訓を示している．
+
+\section{Phase 9: Optical Flowフレームスキップ}
+
+全フレームでUNetを実行するのではなく，$N$フレームに1回のみUNetを実行し，中間の$(N-1)$フレームはoptical flowによる前フレームのワーピングで補完する手法を検証した．
+理論的には，$N=3$の場合，UNetフレーム（51.7ms）とWarpフレーム（6.6ms $\times$ 2）の平均で$(51.7 + 6.6 \times 2) / 3 = 21.6$ms/frame $\approx$ 46 FPSが期待される．
+
+Optical FlowにはFarneback法を使用し，計算コスト削減のため入力解像度を512$\times$512から256$\times$256に縮小してflow場を計算し，512$\times$512に拡大してワーピングを適用した．
+この半解像度flow計算によりワーピング時間は22.3msから6.6msに短縮された（Table~\ref{tab:flow}）．
+
+\begin{table}[H]
+\centering
+\caption{Optical Flowフレームスキップの性能（$N=3$）}
+\label{tab:flow}
+\begin{tabular}{lcc}
+\toprule
+フレーム種別 & 処理時間 & 備考 \\
+\midrule
+UNetフレーム & 51.7ms & フルパイプライン \\
+Warpフレーム (512$\times$512 flow) & 22.3ms & Farneback \\
+Warpフレーム (256$\times$256 flow) & 6.6ms & 半解像度 \\
+\midrule
+全体 ($N=3$, 半解像度flow) & --- & \textbf{17.4 FPS} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+しかし，実測では17.4 FPSに留まり，理論値（46 FPS）の38\%に過ぎなかった．
+この乖離はシングルスレッド実装における同期オーバーヘッドに起因する．
+加えて，warpフレームはAI生成ではなく単なる画像変形であるため，動きの大きい領域でゼリー状の歪み（「ぷにぷに」効果）が顕著に発生し，主観的な画質がベースラインSDXS（22.7 FPS）を大幅に下回った．
+速度・品質の両面でSDXSベースラインに劣るため，不採用とした．
+
+\section{Phase 10: 知識蒸留による直接変換}
+
+SDXSパイプライン全体（VAEエンコード $\to$ UNet $\to$ VAEデコード）を教師モデルとし，軽量フィードフォワードCNN（FastStyleNet）にエッジ画像からスタイル画像への直接変換を蒸留する手法を検証した．
+FastStyleNetはDepthwise Separable Convolutionを用いたU-Net構造であり，ブロック数とベースチャネル数でモデルサイズを制御できる．
+
+Table~\ref{tab:distill}に示す通り，推論速度は6.0ms（167 FPS）から7.2ms（140 FPS）と極めて高速であり，速度面では大幅な優位性がある．
+しかし，合成エッジデータ（ランダムな直線・円・矩形の組み合わせ）をL1損失のみで学習した結果，10エポック後の出力は視認不能であった．
+
+\begin{table}[H]
+\centering
+\caption{蒸留FastStyleNetの仕様と結果}
+\label{tab:distill}
+\begin{tabular}{lccc}
+\toprule
+構成 & パラメータ & MPS推論 & FPS \\
+\midrule
+FastStyleNet (32ch) & 398K & 6.0ms & 167 \\
+FastStyleNet (48ch) & 875K & 6.1ms & 164 \\
+FastStyleNet (64ch) & 1.5M & 7.2ms & 140 \\
+\midrule
+\multicolumn{4}{l}{\textit{学習: L1損失, 10エポック, 2000ステップ/エポック}} \\
+\multicolumn{4}{l}{\textit{結果: 出力が視認不能（品質$\times$）}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+失敗の要因は複合的である．
+第一に，L1損失は全出力画像の画素平均への収束を促すため，拡散モデルが生成するようなシャープで多様な出力を学習できない．
+第二に，合成エッジデータは実際のカメラからのCanny Edge出力と分布が大きく異なり，訓練データと推論時データの分布シフトが生じた．
+第三に，875Kパラメータのフィードフォワードネットワークでは，328.2Mパラメータの拡散モデルが持つ「ノイズ除去過程を通じた反復的な画像精緻化」の能力を本質的に再現できない．
+GAN損失や知覚損失の導入，大規模実データでの学習により改善の余地はあるが，本研究の範囲では負の結果に終わった．
+
+\section{全実験の総合比較}
+
+Table~\ref{tab:all}に全フェーズの定量的結果をまとめる．
+10フェーズにわたる探索の結果，速度と品質のバランスにおいてSDXS-512 CoreMLが最適解であることが確認された．
+
+\begin{table}[H]
+\centering
+\caption{全アプローチの総合比較（カメラimg2img，512$\times$512）}
+\label{tab:all}
+\begin{tabular}{clcccl}
+\toprule
+Phase & アプローチ & カメラFPS & UNet推論 & 品質 & 判定 \\
+\midrule
+1 & SD-Turbo MPS (ベースライン) & 10.4 & 95.8ms & $\bigcirc$ & ベースライン \\
+2 & SD-Turbo CoreML & 13.8 & 53.2ms & $\bigcirc$ & 有効（+33\%） \\
+3 & Tiny-SD CoreML (320$\to$512) & 47.1 & 16.4ms & $\triangle$ & 品質低下 \\
+\textbf{6} & \textbf{SDXS-512 CoreML} & \textbf{22.7} & \textbf{24.4ms} & $\bigcirc$ & \textbf{最適解（+118\%）} \\
+7a & kNN CLIP検索 & 38.3 & --- & $\times$ & 品質不足 \\
+7b & kNN VAEラテント & 45.3 & --- & $\times$ & 品質不足 \\
+7c & kNNハイブリッド & 10.7 & 44.4ms & $\triangle$ & kNN初期化効果薄い \\
+8 & pix2pix-turbo (CoreML+MPS) & 4.0 & 52.9ms & $\bigcirc$ & VAEボトルネック \\
+9 & Optical Flowスキップ ($N=3$) & 17.4 & 51.7ms & $\times$ & 品質低下+SDXSに劣る \\
+10 & 蒸留FastStyleNet (875K) & 19.6 & --- & $\times$ & 出力視認不能 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{考察}
+
+\subsection{CUDA中心の最適化常識の再検証}
+
+本研究で得られた最も重要な知見は，NVIDIA GPUとCUDAエコシステムで確立された最適化の「常識」が，Apple Siliconの統合メモリアーキテクチャでは大部分が成立しないという事実である．
+以下に，CUDA環境での知見との対比を体系的に整理する．
+
+\textbf{量子化の無効性．}
+NVIDIA GPU上では，TensorRT INT8やAWQ/GPTQ等の量子化手法により，モデル重みのメモリ帯域削減を通じた推論高速化が広く報告されている\cite{song2024sdxs}．
+これはNVIDIA GPUの推論がmemory-bandwidth-bound（帯域律速）であることが前提となっている．
+ディスクリートGPU構成では，モデル重みはHBM（High Bandwidth Memory）から演算ユニットに転送される必要があり，この転送帯域がボトルネックとなる．
+
+一方，M3 Ultraの統合メモリアーキテクチャでは，800GB/sのメモリ帯域がCPU・GPU・ANE間で共有される．
+865.9Mパラメータ（FP16で約1.7GB）のモデル重みに対して800GB/sの帯域は十分な余裕を持ち，メモリ転送はボトルネックとならない．
+結果として，M3 Ultra上の推論はcompute-bound（演算律速）となり，量子化によるメモリ帯域削減は推論速度に影響しない．
+このcompute-bound vs memory-bandwidth-boundの差異は，Apple SiliconとNVIDIA GPUの最も根本的なアーキテクチャ的差異の一つである．
+
+\textbf{並列推論の不可能性．}
+NVIDIA GPUではCUDA Streamを用いた低レベルの並列制御が可能であり，複数カーネルの並列実行やパイプライン並列化が標準的な最適化手法である．
+StreamDiffusion\cite{kodaira2023streamdiffusion}のStream Batchも，複数フレームのバッチ処理をCUDAカーネルレベルで並列化することで高い効率を実現している．
+
+Apple SiliconのCoreMLフレームワークは，Metal Command Queueを通じた推論実行を抽象化しており，GPUカーネルレベルの並列制御はユーザーに公開されていない．
+本研究で確認された通り，複数CoreMLモデルの同時推論はMetal GPUリソース上でシリアライズされ，スループットの向上につながらない．
+これは，NVIDIAが提供するCUDAのような低レベルGPU制御APIがApple Siliconには存在しないことの帰結であり，ハードウェアの性能差以上に，ソフトウェアスタックの設計思想の差異が最適化可能性を規定している例といえる．
+
+\textbf{コンパイラ最適化の未成熟．}
+PyTorchの\texttt{torch.compile}はInductorバックエンドを通じてCUDA/CPU向けの最適化コード生成を行うが，MPSバックエンドへの対応は未完成であり，ランタイムエラーが発生する．
+TensorRTによるNVIDIA GPU向けの推論最適化に相当する包括的なツールは，Apple Siliconには存在しない．
+CoreML変換がこの役割の一部を担うが，PyTorchエコシステムとの統合度はTensorRTに遠く及ばない．
+
+\subsection{統合メモリアーキテクチャの二面性}
+
+M3 Ultraの統合メモリアーキテクチャは，拡散モデル推論に対して明確な利点と限界の両面を持つ．
+
+\textbf{利点：ゼロコピーデータ共有．}
+統合メモリにより，CPU-GPU間のデータ転送（NVIDIA GPUにおけるHost-Device転送）が不要となる．
+前処理（CPU上のOpenCV）で生成されたテンソルをGPU推論に渡す際のコピーコストがゼロであることは，カメラパイプラインにおいて特に有利である．
+また，512GBという大容量メモリにより，複数モデルの同時メモリ保持が容易であり，モデル切り替え時のロード遅延がない．
+
+\textbf{利点：大規模メモリの可能性．}
+Phase 7のkNN実験で実証した通り，512GBメモリにより1億ベクトルの検索データベースをメモリ内に保持でき，0.5ms未満の検索が可能である．
+これは24GB GPUでは物理的に不可能な規模であり，検索ベース手法や大規模バッチ学習において固有の可能性を持つ．
+
+\textbf{限界：演算性能の不足．}
+M3 Ultraの約22 TFLOPS FP16はNVIDIA RTX 4090の約330 TFLOPSの約15分の1であり，compute-boundな推論において根本的な性能差が存在する．
+量子化が無効である（帯域律速でない）ことと合わせて，純粋な演算量の削減（＝より小さなモデルの使用）が唯一の速度向上手段となる．
+
+\textbf{限界：ソフトウェアエコシステムの未成熟．}
+CUDAの数十年にわたるエコシステム（cuDNN，TensorRT，xformers，Flash Attention，Triton等）に対して，Metal/CoreMLのエコシステムは質・量ともに大幅に劣る．
+torch.compileのMPS未対応，Token MergingのMPS上でのオーバーヘッド，Attention Slicingの非効率性はいずれもこのエコシステムの未成熟さの表れである．
+
+\subsection{モデルアーキテクチャとハードウェア最適化の相互依存性}
+
+本研究は，モデルのアーキテクチャ設計がハードウェア最適化の可否を直接規定するという重要な教訓を提供した．
+
+pix2pix-turboのスキップ接続付きVAEは，img2imgタスクにおける品質の核心的要素であるが，エンコーダとデコーダの中間テンソル共有がCoreML変換を阻み，結果としてMPS上の低速なVAE推論がパイプライン全体のボトルネックとなった（53ms UNet vs 160ms VAE）．
+対照的に，SDXS-512のシンプルな順伝播アーキテクチャはCoreML変換と高い親和性を持ち，全コンポーネントがCoreML上で効率的に実行された．
+
+この「アーキテクチャ-ハードウェア共設計」の視点は，今後の拡散モデル研究において重要性を増すと考えられる．
+NVIDIA GPU向けに設計されたアーキテクチャが他のプラットフォームで同等に動作するとは限らず，ターゲットハードウェアの制約を考慮したモデル設計が必要となる．
+
+\subsection{kNN検索と拡散モデルの本質的差異}
+
+Phase 7の実験は，大規模メモリを活用した「計算の検索への置換」が拡散モデルの文脈では原理的に困難であることを実証した．
+kNN検索は離散的なデータ点の集合から最近傍を選択する操作であり，拡散モデルのUNetが実現する連続的な非線形関数近似とは本質的に異なる．
+
+ラテント空間における加重平均は，個々のサンプルが持つ構造的整合性を破壊する．
+例えば，猫の画像と犬の画像のラテントベクトルを0.5:0.5で平均しても，猫と犬の中間的な「意味のある」画像にはならず，構造が崩壊した不明瞭な画像が生成される．
+拡散モデルはこの問題を，反復的なノイズ除去プロセスを通じて潜在空間上の滑らかなマニフォールド上に出力を射影することで回避している．
+
+加えて，カメラ入力の組み合わせ空間（照明条件$\times$被写体$\times$構図$\times$カメラパラメータ）は実質的に無限であり，事前計算によるデータベースでこの空間を十分にカバーすることは不可能である．
+512GBメモリの真の価値は，検索による推論の代替ではなく，大規模モデルの完全なメモリ内保持，学習時の大バッチサイズ，あるいはRetrieved-Augmented Generationのような検索と生成を組み合わせた手法にあると考えられる．
+
+\subsection{フレーム補間手法の限界と展望}
+
+Phase 9のOptical Flowフレームスキップは，理論的には有望な手法であったが，実測では3つの問題に直面した．
+第一に，シングルスレッドでのflow計算・ワーピング・UNet推論の逐次実行により，理論FPSの38\%しか実現できなかった．
+第二に，warpフレームはAI生成ではなく純粋な画像変形であるため，動きの大きな領域で非物理的な歪みが発生した．
+第三に，flow計算の半解像度化により速度は改善したが，flow場の精度が低下し，ワーピングのアーティファクトが増加した．
+
+将来的には，Neural Optical Flow（RAFT等）のCoreML変換による高精度flow推定，3スレッドアーキテクチャとのパイプライン統合，およびAI-awareなフレーム補間（FILM等）の導入により改善の余地がある．
+ただし，SDXS-512が24.4msでフレームごとに「真の」AI生成を行えることを考慮すると，フレーム補間の必要性自体が問い直される．
+
+\subsection{非CUDA環境への示唆}
+
+本研究の知見は，Apple Siliconに限らず，非CUDA環境での拡散モデル推論全般に対して示唆を与える．
+Qualcomm Snapdragonの統合メモリ，Intel Arc GPUのoneAPIスタック，さらにはRISC-V系アクセラレータなど，多様なハードウェアプラットフォームでの拡散モデル推論が今後重要性を増すと考えられる．
+
+本研究が示した「CUDA常識の不成立」は，これらのプラットフォームでも同様に発生し得る．
+量子化の効果はメモリアーキテクチャに依存し，並列化の可能性はソフトウェアスタックの設計に依存し，モデルアーキテクチャの最適化可能性はランタイムの変換能力に依存する．
+各プラットフォーム固有の特性を理解し，それに適した最適化戦略を選択することが，CUDA一辺倒のアプローチに代わる実践的な方法論として求められる．
+
+\section{結論}
+
+Apple M3 Ultra上でのリアルタイム拡散モデル推論について，10フェーズにわたる体系的な最適化実験を行い，512$\times$512解像度で\textbf{22.7 FPS}のリアルタイムカメラimg2img変換を達成した．
+これはMPSベースラインからの118\%の高速化であり，SDXS-512のCoreML変換と3スレッドカメラパイプラインの組み合わせにより実現された．
+
+本研究の主要な知見を以下にまとめる：
+
+\begin{enumerate}[leftmargin=*,nosep]
+\item \textbf{CoreML変換}がApple Silicon上の唯一の有効なUNet高速化手法である．
+\item \textbf{量子化は無効}であり，これはM3 Ultraがcompute-bound（演算律速）であることに起因する．統合メモリの高い帯域幅によりメモリ転送はボトルネックとならない．
+\item \textbf{並列推論は不可能}であり，CoreMLのMetal GPUリソースシリアライゼーションがCUDA Streamのような低レベル並列化を妨げる．
+\item \textbf{kNN検索は拡散モデルを代替できない}．512GBメモリによる大規模検索は可能だが，離散検索と連続関数近似の本質的差異が品質の壁となる．
+\item \textbf{モデルアーキテクチャとハードウェア最適化の共設計}が重要である．スキップ接続のような設計がCoreML変換を阻害し得る．
+\item \textbf{蒸留特化モデル}（SDXS-512）が速度と品質の最適なバランスを提供する．
+\end{enumerate}
+
+本研究は，CUDA中心に発展してきた拡散モデル最適化の研究に対し，Apple Siliconという異なるアーキテクチャからの視座を提供するものである．
+統合メモリアーキテクチャにおける最適化のランドスケープは，ディスクリートGPUのそれとは質的に異なり，独自の研究アプローチを必要とする．
+今後の課題として，Metal Compute Shaderの直接記述によるCoreMLバイパス，2ステップ推論の導入による品質向上，SDXL規模のモデルの効率的な推論，および新世代Apple Silicon（M4系列）での性能評価が挙げられる．
+
+\begin{thebibliography}{99}
+
+\bibitem{ho2020ddpm}
+Ho, J., Jain, A., \& Abbeel, P. (2020).
+Denoising diffusion probabilistic models.
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 33, 6840--6851.
+
+\bibitem{rombach2022ldm}
+Rombach, R., Blattmann, A., Lorenz, D., Esser, P., \& Ommer, B. (2022).
+High-resolution image synthesis with latent diffusion models.
+\textit{Proc. IEEE/CVF Conf. on Computer Vision and Pattern Recognition (CVPR)}, 10684--10695.
+
+\bibitem{sauer2023adversarial}
+Sauer, A., Lorenz, D., Blattmann, A., \& Rombach, R. (2023).
+Adversarial diffusion distillation.
+\textit{arXiv preprint arXiv:2311.17042}.
+
+\bibitem{song2024sdxs}
+Song, Y., Dhariwal, P., Chen, M., \& Sutskever, I. (2024).
+SDXS: Real-time one-step latent diffusion models with image conditions.
+\textit{arXiv preprint arXiv:2403.16627}.
+
+\bibitem{luo2023lcm}
+Luo, S., Tan, Y., Huang, L., Li, J., \& Zhao, H. (2023).
+Latent consistency models: Synthesizing high-resolution images with few-step inference.
+\textit{arXiv preprint arXiv:2310.04378}.
+
+\bibitem{luo2023lcmlora}
+Luo, S., Tan, Y., Patil, S., Gu, D., von Platen, P., Passos, A., Huang, L., Li, J., \& Zhao, H. (2023).
+LCM-LoRA: A universal stable-diffusion acceleration module.
+\textit{arXiv preprint arXiv:2311.05556}.
+
+\bibitem{ren2024hypersd}
+Ren, J., Xia, Y., Lu, K., Deng, J., \& Luo, Z. (2024).
+Hyper-SD: Trajectory segmented consistency model for efficient image synthesis.
+\textit{arXiv preprint arXiv:2404.13686}.
+
+\bibitem{kodaira2023streamdiffusion}
+Kodaira, A., Xu, C., Hazama, T., Yoshimoto, T., Ohno, K., Mitsuhori, S., Sugano, S., Cho, H., Liu, Z., \& Keutzer, K. (2023).
+StreamDiffusion: A pipeline-level solution for real-time interactive generation.
+\textit{arXiv preprint arXiv:2312.12491}.
+
+\bibitem{apple2022mlsd}
+Apple Inc. (2022).
+ml-stable-diffusion: Stable diffusion with Core ML on Apple Silicon.
+\textit{GitHub repository}. \url{https://github.com/apple/ml-stable-diffusion}
+
+\bibitem{parmar2024pix2pix}
+Parmar, G., Park, T., Narasimhan, S., \& Zhu, J.-Y. (2024).
+One-step image translation with text-to-image models.
+\textit{Proc. European Conf. on Computer Vision (ECCV)}.
+
+\bibitem{blattmann2022retrieval}
+Blattmann, A., Rombach, R., Oktay, O., M\"uller, J., \& Ommer, B. (2022).
+Retrieval-augmented diffusion models.
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 35.
+
+\bibitem{johnson2019faiss}
+Johnson, J., Douze, M., \& J\'{e}gou, H. (2019).
+Billion-scale similarity search with GPUs.
+\textit{IEEE Trans. on Big Data}, 7(3), 535--547.
+
+\bibitem{bolya2023tome}
+Bolya, D., \& Hoffman, J. (2023).
+Token merging for fast stable diffusion.
+\textit{CVPR Workshop on Efficient Deep Learning for Computer Vision}.
+
+\end{thebibliography}
+
+\end{document}

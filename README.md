@@ -150,8 +150,8 @@ Benchmarked on Apple M3 Ultra (60-core GPU, 512GB unified memory):
 > - M1/M2: ~5-8 FPS
 > - M1/M2 Pro: ~8-12 FPS
 > - M1/M2/M3 Max: ~12-18 FPS
+> - **M4 Max (40-core GPU, 128GB): ~15.4 FPS** (SDXS-512, measured)
 > - M3 Ultra: ~22 FPS
-> - M4 Max: TBD
 
 ## Experiment Report
 

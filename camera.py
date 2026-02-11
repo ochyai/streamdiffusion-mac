@@ -529,9 +529,9 @@ def main():
     parser.add_argument("--strength", type=float, default=0.5)
     parser.add_argument("--blend", type=float, default=0.0,
                         help="Camera blend (0.0=AI only, 0.3=30%% camera)")
-    parser.add_argument("--ema", type=float, default=0.85,
+    parser.add_argument("--ema", type=float, default=0.4,
                         help="EMA smoothing (0=none, 0.9=heavy)")
-    parser.add_argument("--feedback", type=float, default=0.3,
+    parser.add_argument("--feedback", type=float, default=0.1,
                         help="Latent feedback (0=none, 0.3=30%% prev frame)")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--coreml-dir", type=str, default=COREML_DIR)

@@ -27,29 +27,27 @@ echo "Architecture: $ARCH"
 echo ""
 
 # --- Check Python ---
+# Note: Python 3.13+ is not supported by coremltools. Use Python 3.10-3.12.
 PYTHON=""
-if command -v python3 &>/dev/null; then
-    PYTHON="python3"
-elif command -v python &>/dev/null; then
-    PYTHON="python"
-else
-    echo "ERROR: Python 3 not found."
-    echo "  Install Python 3.9+ via:"
-    echo "    brew install python@3.11"
-    echo "  or download from https://www.python.org/"
+for py in python3.12 python3.11 python3.10 python3 python; do
+    if command -v "$py" &>/dev/null; then
+        PY_MINOR_VER=$("$py" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+        PY_MAJOR_VER=$("$py" -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
+        if [[ "$PY_MAJOR_VER" -eq 3 && "$PY_MINOR_VER" -ge 9 && "$PY_MINOR_VER" -le 12 ]]; then
+            PYTHON="$py"
+            break
+        fi
+    fi
+done
+
+if [[ -z "$PYTHON" ]]; then
+    echo "ERROR: Python 3.9-3.12 is required (coremltools does not support 3.13+)."
+    echo "  Install via: brew install python@3.12"
     exit 1
 fi
 
 PY_VERSION=$($PYTHON --version 2>&1)
 echo "Python: $PY_VERSION"
-
-# Check Python version >= 3.9
-PY_MAJOR=$($PYTHON -c "import sys; print(sys.version_info.major)")
-PY_MINOR=$($PYTHON -c "import sys; print(sys.version_info.minor)")
-if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 9 ]]; then
-    echo "ERROR: Python 3.9+ is required (found $PY_VERSION)"
-    exit 1
-fi
 echo ""
 
 # --- Create virtual environment ---
@@ -72,20 +70,20 @@ echo ""
 echo "Installing Python dependencies..."
 pip install --upgrade pip
 
-# PyTorch with MPS support (nightly or stable with Metal)
+# PyTorch with MPS support (pinned for coremltools compatibility)
 echo ""
 echo "[1/5] Installing PyTorch..."
-pip install torch torchvision
+pip install 'torch>=2.4.0,<2.5.0' 'torchvision>=0.19.0,<0.20.0'
 
 # Hugging Face diffusers + transformers
 echo ""
 echo "[2/5] Installing diffusers and transformers..."
-pip install diffusers transformers accelerate
+pip install 'diffusers>=0.30.0,<0.31.0' transformers accelerate
 
-# Core ML Tools
+# Core ML Tools (pinned to 8.x for compatibility)
 echo ""
 echo "[3/5] Installing coremltools..."
-pip install coremltools
+pip install 'coremltools>=8.1,<9.0'
 
 # OpenCV for camera
 echo ""
@@ -96,6 +94,31 @@ pip install opencv-python
 echo ""
 echo "[5/5] Installing NumPy..."
 pip install numpy
+
+# --- Patch coremltools _cast bug (numpy scalar conversion) ---
+echo ""
+echo "[Patch] Applying coremltools fix for numpy scalar conversion..."
+python -c "
+import importlib, pathlib, re
+spec = importlib.util.find_spec('coremltools')
+if spec and spec.submodule_search_locations:
+    ops = pathlib.Path(spec.submodule_search_locations[0]) / 'converters/mil/frontend/torch/ops.py'
+    if ops.exists():
+        src = ops.read_text()
+        old = 'if not isinstance(x.val, dtype):\n            res = mb.const(val=dtype(x.val), name=node.name)'
+        new = '''if not isinstance(x.val, dtype):
+            val = x.val
+            if hasattr(val, 'item'):
+                val = val.item()
+            res = mb.const(val=dtype(val), name=node.name)'''
+        if 'val = x.val' in src:
+            print('  Patch already applied.')
+        elif old in src:
+            ops.write_text(src.replace(old, new))
+            print('  Patch applied.')
+        else:
+            print('  WARNING: Could not find target code to patch.')
+"
 
 echo ""
 echo "============================================"

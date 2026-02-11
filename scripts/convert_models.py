@@ -39,9 +39,14 @@ def convert_unet(model_id, hidden_size, save_path):
     from diffusers import StableDiffusionPipeline
 
     print(f"  Loading UNet from {model_id}...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id, torch_dtype=torch.float16, variant="fp16"
-    )
+    try:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_id, torch_dtype=torch.float16, variant="fp16"
+        )
+    except ValueError:
+        pipe = StableDiffusionPipeline.from_pretrained(
+            model_id, torch_dtype=torch.float16
+        )
     unet = pipe.unet.eval().float().cpu()
 
     class UNetWrapper(torch.nn.Module):

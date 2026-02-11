@@ -104,7 +104,7 @@ pip install -r "$REQ_FILE"
 echo ""
 echo "[Patch] Checking coremltools for numpy scalar conversion fix..."
 python -c "
-import importlib, pathlib, re
+import importlib.util, pathlib, re
 spec = importlib.util.find_spec('coremltools')
 if spec and spec.submodule_search_locations:
     ops = pathlib.Path(spec.submodule_search_locations[0]) / 'converters/mil/frontend/torch/ops.py'

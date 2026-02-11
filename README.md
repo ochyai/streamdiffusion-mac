@@ -32,6 +32,16 @@ python scripts/convert_models.py
 python camera.py --prompt "oil painting style, masterpiece"
 ```
 
+### Troubleshooting: Legacy Setup
+
+If the default setup fails (e.g., installation errors or poor performance), try the legacy profile which uses older, more conservative dependency versions:
+
+```bash
+./setup.sh --legacy
+```
+
+This installs PyTorch 2.0.x and CoreML Tools 6.x, which have broader compatibility across different macOS and Apple Silicon configurations. See [requirements-legacy.txt](requirements-legacy.txt) for exact versions.
+
 ## Manual Installation
 
 If you prefer manual setup:

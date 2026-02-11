@@ -3,6 +3,22 @@
 # Tested on: macOS 14+ (Sonoma/Sequoia) with Apple Silicon (M1/M2/M3/M4)
 set -e
 
+# --- Parse arguments ---
+USE_LEGACY=false
+for arg in "$@"; do
+    case "$arg" in
+        --legacy) USE_LEGACY=true ;;
+        --help|-h)
+            echo "Usage: ./setup.sh [--legacy]"
+            echo ""
+            echo "Options:"
+            echo "  --legacy  Use older, more conservative dependency versions."
+            echo "            Try this if the default setup fails on your machine."
+            exit 0
+            ;;
+    esac
+done
+
 echo "============================================"
 echo " StreamDiffusion for Mac — Setup"
 echo "============================================"
@@ -67,37 +83,26 @@ source "$VENV_DIR/bin/activate"
 echo ""
 
 # --- Install dependencies ---
-echo "Installing Python dependencies..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if $USE_LEGACY; then
+    REQ_FILE="$SCRIPT_DIR/requirements-legacy.txt"
+    echo "Installing dependencies (legacy profile)..."
+else
+    REQ_FILE="$SCRIPT_DIR/requirements.txt"
+    echo "Installing dependencies..."
+fi
+
+echo "  Using: $(basename "$REQ_FILE")"
+echo ""
 pip install --upgrade pip
-
-# PyTorch with MPS support (pinned for coremltools compatibility)
-echo ""
-echo "[1/5] Installing PyTorch..."
-pip install 'torch>=2.4.0,<2.5.0' 'torchvision>=0.19.0,<0.20.0'
-
-# Hugging Face diffusers + transformers
-echo ""
-echo "[2/5] Installing diffusers and transformers..."
-pip install 'diffusers>=0.30.0,<0.31.0' transformers accelerate
-
-# Core ML Tools (pinned to 8.x for compatibility)
-echo ""
-echo "[3/5] Installing coremltools..."
-pip install 'coremltools>=8.1,<9.0'
-
-# OpenCV for camera
-echo ""
-echo "[4/5] Installing OpenCV..."
-pip install opencv-python
-
-# NumPy
-echo ""
-echo "[5/5] Installing NumPy..."
-pip install numpy
+pip install -r "$REQ_FILE"
 
 # --- Patch coremltools _cast bug (numpy scalar conversion) ---
+# This patch is needed for coremltools 8.x with newer numpy.
+# For coremltools 6.x (legacy), the patch target may not exist and is safely skipped.
 echo ""
-echo "[Patch] Applying coremltools fix for numpy scalar conversion..."
+echo "[Patch] Checking coremltools for numpy scalar conversion fix..."
 python -c "
 import importlib, pathlib, re
 spec = importlib.util.find_spec('coremltools')

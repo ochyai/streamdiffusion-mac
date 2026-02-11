@@ -8,7 +8,7 @@ Real-time camera image-to-image transformation using diffusion models on Apple S
 
 - **macOS 14+** (Sonoma or later)
 - **Apple Silicon** (M1 / M2 / M3 / M4 series)
-- **Python 3.9+**
+- **Python 3.9-3.12** (coremltools does not support 3.13+)
 - Camera (built-in or USB webcam)
 
 ## Quick Start
@@ -32,15 +32,28 @@ python scripts/convert_models.py
 python camera.py --prompt "oil painting style, masterpiece"
 ```
 
-### Troubleshooting: Legacy Setup
+## Dependencies
 
-If the default setup fails (e.g., installation errors or poor performance), try the legacy profile which uses older, more conservative dependency versions:
+`setup.sh` installs all dependencies from `requirements.txt`. Key version constraints:
+
+| Package | Default | Legacy (`--legacy`) |
+|---------|---------|---------------------|
+| PyTorch | 2.1-2.5.x | 2.0.x |
+| CoreML Tools | 7.x-8.x | 6.x |
+| diffusers | 0.21+ | 0.21.x |
+| numpy | 1.x (< 2.0) | 1.x (< 2.0) |
+
+- **Default** (`requirements.txt`): Tested with torch 2.5.1 + coremltools 8.3 on M3 Ultra / M4 Max.
+- **Legacy** (`requirements-legacy.txt`): Conservative versions for environments where the default fails.
+
+### Troubleshooting
+
+If `./setup.sh` fails or you experience issues, try the legacy profile:
 
 ```bash
+rm -rf .venv
 ./setup.sh --legacy
 ```
-
-This installs PyTorch 2.0.x and CoreML Tools 6.x, which have broader compatibility across different macOS and Apple Silicon configurations. See [requirements-legacy.txt](requirements-legacy.txt) for exact versions.
 
 ## Manual Installation
 
@@ -52,10 +65,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install torch torchvision
-pip install diffusers transformers accelerate
-pip install coremltools
-pip install opencv-python numpy
+pip install -r requirements.txt
 
 # Convert models
 python scripts/convert_models.py

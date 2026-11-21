@@ -1,5 +1,16 @@
 # StreamDiffusion for Mac
 
+<!-- about -->
+> **このリポは何か**：Apple Silicon上でCoreMLと拡散モデルを使い、カメラ映像を指定した画風にリアルタイムで変換する。
+>
+> **What this is**: CoreML-accelerated diffusion models transform live camera footage on Apple Silicon into the visual style described by a text prompt.
+>
+> **まず開く / Start here**：`python camera.py --prompts`
+>
+> **近いリポ / Related**：[autostream-mac](https://github.com/ochyai/autostream-mac)（AIが推論処理を書き換え、1フレームあたりの処理時間を比較する。 / Uses an AI agent to edit the inference pipeline and benchmark the time per frame.）・[TangoFlux-Endless](https://github.com/ochyai/TangoFlux-Endless)（Apple Silicon 上で文章から音を作り、途切れない音風景にする。 / Generates text-to-audio on Apple Silicon and crossfades it into an endless soundscape.）
+<!-- /about -->
+
+
 Real-time camera image-to-image transformation using diffusion models on Apple Silicon, accelerated with CoreML.
 
 **22.7 FPS** at 512x512 resolution on Apple M3 Ultra with SDXS-512.
